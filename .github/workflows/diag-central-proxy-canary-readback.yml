@@ -1,0 +1,58 @@
+name: Central Proxy Canary Readback
+
+on:
+  push:
+    branches:
+      - diag/central-proxy-canary-readback-20260906
+
+permissions:
+  contents: read
+
+jobs:
+  readback:
+    runs-on: [self-hosted, macOS, ARM64, mac-studio-direct, repo-zh4men9--agent-runner-lab]
+    timeout-minutes: 5
+    steps:
+      - name: Inspect central runner state read-only
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ROOT="$HOME/.local/share/ai-execution-infra/actions-runner"
+          export ROOT
+          python3 - <<'PY'
+          import hashlib
+          import os
+          import subprocess
+          from pathlib import Path
+
+          root=Path(os.environ['ROOT'])
+          env=root/'.env'
+          print('CENTRAL_ROOT_EXISTS=' + str(root.is_dir()).lower())
+          if env.is_file():
+              raw=env.read_bytes()
+              print('CENTRAL_ENV_SHA256=' + hashlib.sha256(raw).hexdigest())
+              keys=[]
+              for raw_line in raw.decode('utf-8',errors='replace').splitlines():
+                  line=raw_line.strip()
+                  if line and not line.startswith('#') and '=' in line:
+                      keys.append(line.split('=',1)[0].strip())
+              print('CENTRAL_ENV_KEYS=' + ','.join(sorted(set(keys))))
+          else:
+              print('CENTRAL_ENV_PRESENT=false')
+
+          try:
+              value=subprocess.run(
+                  ['./svc.sh','status'], cwd=root, text=True, capture_output=True,
+                  check=False, timeout=5,
+              )
+          except subprocess.TimeoutExpired:
+              print('CENTRAL_SVC_STATUS=TIMEOUT_5S')
+          else:
+              print('CENTRAL_SVC_STATUS_RC=' + str(value.returncode))
+              if value.stdout.strip():
+                  print(value.stdout.strip())
+              if value.stderr.strip():
+                  print('CENTRAL_SVC_STDERR=' + value.stderr.strip().replace('\n',' | '))
+          PY
+          pgrep -fl "$ROOT/bin/Runner.Listener" || true
+          echo 'CENTRAL_PROXY_CANARY_READBACK=PASS'
