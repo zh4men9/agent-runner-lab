@@ -1,0 +1,121 @@
+name: Recover Central Proxy Canary
+
+on:
+  push:
+    branches:
+      - diag/central-proxy-canary-readback-20260906
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: [self-hosted, macOS, ARM64, mac-studio-direct, repo-zh4men9--agent-runner-lab]
+    timeout-minutes: 5
+    steps:
+      - name: Restore exact pre-canary env and central service
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export ROOT="$HOME/.local/share/ai-execution-infra/actions-runner"
+          export BACKUP_ROOT="$HOME/.local/share/ai-execution-infra/proxy-canary-backups/central-34038021809"
+          export EXPECTED_SHA='b6940a63cd718499e11e714f9e39962afe8368801dcea86a56e37ebefc33ff14'
+          export PROXY_URL='http://127.0.0.1:7890'
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import shutil
+          import subprocess
+          import time
+          from pathlib import Path
+
+          root=Path(os.environ['ROOT'])
+          backup_root=Path(os.environ['BACKUP_ROOT'])
+          expected=os.environ['EXPECTED_SHA']
+          proxy=os.environ['PROXY_URL']
+          env_path=root/'.env'
+          backup=backup_root/'env.before'
+          rollback=backup_root/'rollback.sh'
+
+          for path in (env_path, backup, rollback, root/'svc.sh'):
+              if not path.exists():
+                  raise SystemExit('RECOVERY_REQUIRED_PATH_MISSING:' + str(path))
+
+          backup_sha=hashlib.sha256(backup.read_bytes()).hexdigest()
+          current_sha=hashlib.sha256(env_path.read_bytes()).hexdigest()
+          print('BACKUP_SHA256=' + backup_sha)
+          print('CURRENT_SHA256_BEFORE=' + current_sha)
+          print('ROLLBACK_SCRIPT=' + str(rollback))
+          if backup_sha != expected:
+              raise SystemExit('BACKUP_SHA_MISMATCH')
+
+          # The target service is already observed stopped. Restore the exact env
+          # first, then start once from this independent repo-specific Runner.
+          shutil.copy2(backup, env_path)
+          restored_sha=hashlib.sha256(env_path.read_bytes()).hexdigest()
+          print('RESTORED_SHA256=' + restored_sha)
+          if restored_sha != expected:
+              raise SystemExit('RESTORED_SHA_MISMATCH')
+
+          try:
+              start=subprocess.run(
+                  ['./svc.sh','start'], cwd=root, text=True, capture_output=True,
+                  check=False, timeout=30,
+              )
+          except subprocess.TimeoutExpired:
+              raise SystemExit('CENTRAL_SERVICE_START_TIMEOUT')
+          print('CENTRAL_SERVICE_START_RC=' + str(start.returncode))
+          if start.stdout.strip():
+              print(start.stdout.strip())
+          if start.stderr.strip():
+              print('CENTRAL_SERVICE_START_STDERR=' + start.stderr.strip().replace('\n',' | '))
+          if start.returncode != 0:
+              raise SystemExit('CENTRAL_SERVICE_START_FAILED')
+
+          gh_env=os.environ.copy()
+          gh_env.pop('GH_TOKEN',None)
+          gh_env.pop('GITHUB_TOKEN',None)
+          gh_env['http_proxy']=proxy
+          gh_env['https_proxy']=proxy
+          gh_env['no_proxy']='localhost,127.0.0.1'
+          remote=None
+          for attempt in range(1,13):
+              try:
+                  result=subprocess.run(
+                      ['gh','api','repos/zh4men9/ai-execution-infra/actions/runners','--paginate'],
+                      text=True,capture_output=True,check=False,timeout=20,env=gh_env,
+                  )
+              except subprocess.TimeoutExpired:
+                  print(f'REMOTE_READ_ATTEMPT={attempt} timeout')
+              else:
+                  if result.returncode == 0:
+                      value=json.loads(result.stdout)
+                      remote=next((r for r in value.get('runners',[]) if r.get('name')=='cheney-mac-studio-01'),None)
+                      if remote is not None:
+                          print('REMOTE_CENTRAL=' + json.dumps({'name':remote.get('name'),'status':remote.get('status'),'busy':remote.get('busy')},sort_keys=True))
+                          if remote.get('status') == 'online':
+                              break
+                  else:
+                      print(f'REMOTE_READ_ATTEMPT={attempt} rc={result.returncode} stderr={(result.stderr or "").strip()}')
+              time.sleep(3)
+          if remote is None or remote.get('status') != 'online':
+              raise SystemExit('CENTRAL_RUNNER_NOT_ONLINE_AFTER_RECOVERY')
+
+          status=subprocess.run(
+              ['./svc.sh','status'], cwd=root, text=True,capture_output=True,
+              check=False,timeout=10,
+          )
+          print('CENTRAL_SERVICE_STATUS_RC=' + str(status.returncode))
+          if status.stdout.strip():
+              print(status.stdout.strip())
+          if status.returncode != 0 or 'Started' not in status.stdout:
+              raise SystemExit('CENTRAL_SERVICE_NOT_STARTED_AFTER_RECOVERY')
+
+          keys=[]
+          for line in env_path.read_text(encoding='utf-8').splitlines():
+              if line.strip() and not line.lstrip().startswith('#') and '=' in line:
+                  keys.append(line.split('=',1)[0].strip())
+          print('CENTRAL_ENV_KEYS_AFTER_RECOVERY=' + ','.join(sorted(set(keys))))
+          print('CENTRAL_PROXY_CANARY_RECOVERY=PASS')
+          PY
