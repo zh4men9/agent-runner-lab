@@ -1,0 +1,77 @@
+name: Central Runner Host Readonly 20260912
+
+on:
+  push:
+    branches:
+      - diag/central-runner-host-readonly-20260912
+    paths:
+      - .github/workflows/central-runner-host-readonly-20260912.yml
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: [self-hosted, macOS, ARM64, repo-zh4men9--agent-runner-lab]
+    timeout-minutes: 5
+    steps:
+      - name: Inspect central Runner roots without mutation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "DIAG_RUNNER_NAME=$RUNNER_NAME"
+          echo "DIAG_RUNNER_OS=$RUNNER_OS"
+          echo "DIAG_RUNNER_ARCH=$RUNNER_ARCH"
+          echo "DIAG_USER=$(id -un)"
+          echo "DIAG_HOST=$(hostname -s)"
+          echo '=== stash ==='
+          if nc -z 127.0.0.1 7890; then echo STASH_7890=PASS; else echo STASH_7890=FAIL; fi
+          echo '=== console user ==='
+          stat -f '%Su' /dev/console | sed 's/^/CONSOLE_USER=/'
+          echo '=== primary ==='
+          primary="$HOME/.local/share/ai-execution-infra/actions-runner"
+          if [[ -x "$primary/svc.sh" ]]; then
+            set +e
+            (cd "$primary" && ./svc.sh status)
+            rc=$?
+            set -e
+            echo "PRIMARY_SVC_RC=$rc"
+            python3 - "$primary/.runner" <<'PY' 2>/dev/null || true
+          import json,sys
+          from pathlib import Path
+          p=Path(sys.argv[1])
+          v=json.loads(p.read_text())
+          print('PRIMARY_AGENT_NAME='+str(v.get('agentName')))
+          print('PRIMARY_POOL_ID='+str(v.get('poolId')))
+          PY
+          else
+            echo PRIMARY_ROOT_OR_SVC_MISSING=1
+          fi
+          echo '=== central pool 02-10 ==='
+          for i in 02 03 04 05 06 07 08 09 10; do
+            r="$HOME/.local/share/ai-execution-infra/central-runner-pool/instances/$i"
+            if [[ ! -x "$r/svc.sh" ]]; then
+              echo "CENTRAL_$i=MISSING"
+              continue
+            fi
+            set +e
+            out="$(cd "$r" && ./svc.sh status 2>&1)"
+            rc=$?
+            set -e
+            printf 'CENTRAL_%s_SVC_RC=%s\n' "$i" "$rc"
+            printf '%s\n' "$out" | sed "s/^/CENTRAL_${i}_STATUS=/" | head -n 8
+          done
+          echo '=== listener processes ==='
+          ps -axo pid=,command= | grep -E 'Runner\.(Listener|Worker)' | grep -v grep | sed -E 's/[[:space:]]+/ /g' || true
+          echo '=== primary launchagent ==='
+          if [[ -f "$primary/.service" && ! -L "$primary/.service" ]]; then
+            svc_path="$(cat "$primary/.service")"
+            case "$svc_path" in
+              "$HOME/Library/LaunchAgents/actions.runner."*.plist)
+                label="$(basename "$svc_path" .plist)"
+                launchctl print "gui/$(id -u)/$label" 2>&1 | grep -E 'state =|pid =|last exit code' || true
+                ;;
+              *) echo PRIMARY_SERVICE_PATH_INVALID=1 ;;
+            esac
+          fi
+          echo HOST_READONLY_DIAG=PASS
